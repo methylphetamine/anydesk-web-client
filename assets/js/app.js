@@ -1,51 +1,57 @@
 /**
- * app.js — AnyDesk Web Client (unofficial front-end demo)
+ * app.js — AnyDesk Web Client (unofficial)
  *
- * Everything below runs locally. No fetch, no WebSocket, no storage of what you
- * type into the address field. The "session" is a canvas animation.
+ * Two real paths:
+ *   1. Launch  — hand the address to the installed AnyDesk app via the documented
+ *                `anydesk:<address>` URL handler. No credentials ever touch this page.
+ *   2. Viewer  — WebRTC screen share between two browser tabs (view-only), brokered
+ *                by PeerJS, media peer-to-peer.
  */
 
-import { RemoteScreen, QUALITY } from './remote-screen.js';
+const PEER_PREFIX = 'adwcv1-';
+const CODE_LEN = 6;
+
+const QUALITY = {
+  speed:    { label: 'Speed',    maxBitrate: 900_000 },
+  balanced: { label: 'Balanced', maxBitrate: 2_500_000 },
+  quality:  { label: 'Quality',  maxBitrate: 6_000_000 },
+};
 
 /* ------------------------------------------------------------------ helpers */
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-const STORE = {
-  self: 'adwc.self',
-  recent: 'adwc.recent',
+const digits = (v) => String(v).replace(/\D/g, '');
+const isAlias = (v) => /^[a-z0-9][a-z0-9._-]*(@[a-z0-9.-]+)?$/i.test(v) && /@/.test(v);
+
+/** 1234567890 -> "123 456 7890"; aliases pass through untouched */
+function group(v) {
+  const raw = String(v).trim();
+  if (!/^\d[\d\s]*$/.test(raw)) return raw;
+  const d = digits(raw).slice(0, 10);
+  return [d.slice(0, 3), d.slice(3, 6), d.slice(6)].filter(Boolean).join(' ');
+}
+
+const groupCode = (v) => digits(v).slice(0, CODE_LEN).replace(/(\d{3})(?=\d)/, '$1 ');
+
+function validAddress(v) {
+  const raw = String(v).trim();
+  if (isAlias(raw)) return true;
+  const n = digits(raw).length;
+  return (n === 9 || n === 10) && /^[\d\s]+$/.test(raw);
+}
+
+function normalizeAddress(v) {
+  const raw = String(v).trim();
+  return isAlias(raw) ? raw : digits(raw);
+}
+
+const randomDigits = (n) => {
+  let out = String(1 + Math.floor(Math.random() * 9));
+  while (out.length < n) out += Math.floor(Math.random() * 10);
+  return out;
 };
-
-const CHAT_REPLIES = [
-  'Got it — flashing now.',
-  'Give me a second, rebooting the device.',
-  'That build looks clean. Logs are in /tmp/build.log.',
-  'Can you see the boot splash on your side?',
-  'Nice, it came up first try.',
-];
-
-const digits = (v) => v.replace(/\D/g, '');
-const group = (v) => digits(v).slice(0, 9).replace(/(\d{3})(?=\d)/g, '$1 ');
-const randomId = () => group(String(Math.floor(100000000 + Math.random() * 899999999)));
-
-function store(key, value) {
-  try {
-    if (value === undefined) return localStorage.getItem(key);
-    localStorage.setItem(key, value);
-  } catch {
-    /* private mode / disabled storage — demo keeps working */
-  }
-  return null;
-}
-
-function readJSON(key, fallback) {
-  try {
-    return JSON.parse(store(key) || '') ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
@@ -53,9 +59,9 @@ const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
 const toastHost = $('#toasts');
 
-function toast(message, { warn = false, ms = 2600 } = {}) {
+function toast(message, { warn = false, error = false, ms = 3200 } = {}) {
   const node = document.createElement('div');
-  node.className = `toast${warn ? ' toast--warn' : ''}`;
+  node.className = `toast${error ? ' toast--error' : warn ? ' toast--warn' : ''}`;
   const dot = document.createElement('span');
   dot.className = 'toast__dot';
   const text = document.createElement('span');
@@ -70,17 +76,34 @@ function toast(message, { warn = false, ms = 2600 } = {}) {
   }, ms);
 }
 
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /* --------------------------------------------------------------------- state */
 
 const state = {
-  view: 'connect',
-  peer: '',
-  quality: 'balanced',
+  view: 'home',
+  role: null,          // 'host' | 'viewer'
+  address: '',
+  code: '',
+  peer: null,
+  conn: null,
+  call: null,
+  stream: null,
   startedAt: 0,
-  timers: [],
-  ticker: 0,
-  screen: null,
-  chatTimer: 0,
+  statsTimer: 0,
+  lastBytes: 0,
+  lastTs: 0,
+  lastFrames: 0,
+  streamTimer: 0,
+  teardown: false,
+  quality: 'balanced',
 };
 
 const viewEls = new Map($$('[data-view]').map((el) => [el.dataset.view, el]));
@@ -95,241 +118,425 @@ function setView(name) {
     else el.setAttribute('aria-hidden', 'true');
   }
   document.body.classList.toggle('is-session', name === 'session');
+  document.body.classList.toggle('is-sharing', name === 'sharing');
   if (name !== 'session') closeAllDrawers();
 
-  if (name === 'connect') {
+  window.scrollTo(0, 0);
+  if (name === 'home') {
     $('#remote-id').focus({ preventScroll: true });
-  } else if (name === 'connecting') {
-    $('#cancel-connect')?.focus({ preventScroll: true });
   } else if (name === 'session') {
-    window.scrollTo(0, 0);
     $('#stage').setAttribute('tabindex', '-1');
     $('#stage').focus({ preventScroll: true });
   }
 }
 
-/* ------------------------------------------------------------------ identity */
+/* ------------------------------------------------------------------- errors */
 
-function initIdentity() {
-  let id = store(STORE.self);
-  if (!id || digits(id).length !== 9) {
-    id = randomId();
-    store(STORE.self, id);
+function setError(el, message) {
+  if (!el) return;
+  el.textContent = message || '';
+  el.hidden = !message;
+}
+
+function clearErrors() {
+  setError($('#launch-error'), '');
+  setError($('#share-error'), '');
+  $('#launch-fallback').hidden = true;
+}
+
+/* --------------------------------------------------------------- launch path */
+
+const idField = $('#remote-id');
+let launchTimer = 0;
+
+idField.addEventListener('input', () => {
+  const raw = idField.value;
+  if (/^[\d\s]+$/.test(raw) || raw === '') {
+    const caret = idField.selectionStart ?? raw.length;
+    const before = digits(raw.slice(0, caret)).length;
+    const next = group(raw);
+    idField.value = next;
+
+    let pos = 0;
+    let seen = 0;
+    while (pos < next.length && seen < before) {
+      if (/\d/.test(next[pos])) seen += 1;
+      pos += 1;
+    }
+    idField.setSelectionRange(pos, pos);
   }
-  $('#self-id').textContent = id;
-}
-
-/* -------------------------------------------------------------------- recent */
-
-function loadRecent() {
-  const list = readJSON(STORE.recent, []);
-  return Array.isArray(list) ? list.filter((r) => r && digits(String(r.id)).length === 9).slice(0, 4) : [];
-}
-
-function saveRecent(id) {
-  const list = loadRecent().filter((r) => r.id !== id);
-  list.unshift({ id, at: Date.now() });
-  store(STORE.recent, JSON.stringify(list.slice(0, 4)));
-  renderRecent();
-}
-
-function relativeTime(ts) {
-  const diff = Math.max(0, Date.now() - ts);
-  const min = Math.floor(diff / 60000);
-  if (min < 1) return 'just now';
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.floor(hr / 24);
-  if (day === 1) return 'yesterday';
-  if (day < 7) return `${day}d ago`;
-  return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-}
-
-function renderRecent() {
-  const list = loadRecent();
-  const wrap = $('#recent-wrap');
-  const host = $('#recent-list');
-
-  wrap.hidden = list.length === 0;
-  host.replaceChildren();
-
-  for (const item of list) {
-    const li = document.createElement('li');
-    li.className = 'recent__item';
-
-    const go = document.createElement('button');
-    go.type = 'button';
-    go.className = 'recent__go';
-    go.dataset.action = 'reconnect';
-    go.dataset.id = item.id;
-
-    const id = document.createElement('span');
-    id.textContent = item.id;
-    const when = document.createElement('span');
-    when.className = 'recent__when';
-    when.textContent = relativeTime(item.at);
-    go.append(id, when);
-
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'recent__x';
-    remove.dataset.action = 'forget';
-    remove.dataset.id = item.id;
-    remove.setAttribute('aria-label', `Forget ${item.id}`);
-    remove.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>';
-
-    li.append(go, remove);
-    host.append(li);
-  }
-}
-
-/* ---------------------------------------------------------------- form input */
-
-const input = $('#remote-id');
-const errorEl = $('#id-error');
-const field = $('.idfield');
-
-function setError(message) {
-  if (!message) {
-    errorEl.hidden = true;
-    errorEl.textContent = '';
-    field.classList.remove('is-invalid');
-    input.setAttribute('aria-invalid', 'false');
-    return;
-  }
-  errorEl.textContent = message;
-  errorEl.hidden = false;
-  field.classList.add('is-invalid');
-  input.setAttribute('aria-invalid', 'true');
-}
-
-input.addEventListener('input', () => {
-  const raw = input.value;
-  const rawCaret = input.selectionStart ?? raw.length;
-  const digitsBefore = digits(raw.slice(0, rawCaret)).length;
-  const next = group(raw);
-
-  input.value = next;
-
-  // rebuild the caret so typing and deleting stay in the same visual spot
-  let pos = 0;
-  let seen = 0;
-  while (pos < next.length && seen < digitsBefore) {
-    if (/\d/.test(next[pos])) seen += 1;
-    pos += 1;
-  }
-  input.setSelectionRange(pos, pos);
-
-  if (!errorEl.hidden && digits(next).length === 9) setError('');
+  if (!$('#launch-error').hidden && validAddress(idField.value)) setError($('#launch-error'), '');
 });
 
-input.addEventListener('keydown', (e) => {
+idField.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     e.preventDefault();
-    $('#connect-form').requestSubmit();
+    $('#launch-form').requestSubmit();
   }
 });
 
-/* -------------------------------------------------------------- connect flow */
+$('#launch-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  launch();
+});
 
-function clearTimers() {
-  state.timers.forEach(clearTimeout);
-  state.timers = [];
-  clearTimeout(state.chatTimer);
-}
+function launch() {
+  clearErrors();
+  const raw = idField.value.trim();
 
-function later(ms, fn) {
-  state.timers.push(setTimeout(fn, ms));
-}
-
-function startConnect(id) {
-  const clean = group(id);
-  if (digits(clean).length !== 9) {
-    setError('Enter all nine digits — the address is three groups of three.');
-    input.focus();
+  if (!validAddress(raw)) {
+    setError(
+      $('#launch-error'),
+      raw ? 'Use a 9–10 digit address or an alias like desk@company.' : 'Enter the address you were given.'
+    );
+    idField.focus();
     return;
   }
 
-  clearTimers();
-  state.peer = clean;
-  setError('');
+  state.address = normalizeAddress(raw);
+  const url = `anydesk:${state.address}`;
 
-  $('#dial-id').textContent = clean;
-  $('#peer-id').textContent = clean;
-  $('#info-peer').textContent = clean;
+  // If the handler exists the OS takes over and this tab loses focus. If we are
+  // still visible a couple of seconds later, offer the manual fallbacks.
+  clearTimeout(launchTimer);
+  launchTimer = setTimeout(() => {
+    if (!document.hidden) $('#launch-fallback').hidden = false;
+  }, 2200);
 
-  // reset handshake UI
-  $$('#steps li').forEach((li) => {
-    li.classList.remove('is-active', 'is-done');
-    li.querySelector('.steps__state').textContent = '—';
-  });
-  $('#progress-bar').style.width = '0%';
-
-  setView('connecting');
-
-  const steps = $$('#steps li');
-  const step = (i, stateText) => {
-    const li = steps[i];
-    if (!li) return;
-    li.classList.add('is-active');
-    li.querySelector('.steps__state').textContent = stateText;
-  };
-  const done = (i) => {
-    const li = steps[i];
-    if (!li) return;
-    li.classList.remove('is-active');
-    li.classList.add('is-done');
-    li.querySelector('.steps__state').textContent = 'ok';
-  };
-
-  later(60, () => { step(0, 'lookup'); $('#progress-bar').style.width = '14%'; });
-  later(700, () => { done(0); step(1, 'handshake'); $('#progress-bar').style.width = '46%'; });
-  later(1450, () => { done(1); step(2, 'attaching'); $('#progress-bar').style.width = '78%'; });
-  later(2150, () => { done(2); $('#progress-bar').style.width = '100%'; });
-  later(2500, () => openSession());
-}
-
-function openSession() {
-  setView('session');
-  state.startedAt = Date.now();
-
-  if (!state.screen) state.screen = new RemoteScreen($('#remote-canvas'));
-  state.screen.setQuality(state.quality);
-  state.screen.start();
-
-  applyQuality(state.quality);
-  resetChat();
-  startTicker();
-  saveRecent(state.peer);
-
-  $('#stage-hint').classList.remove('is-faded');
-  setTimeout(() => $('#stage-hint').classList.add('is-faded'), 5000);
-
-  toast(`Session opened with ${state.peer}`);
-}
-
-function endSession({ silent = false } = {}) {
-  clearTimers();
-  clearInterval(state.ticker);
-  state.ticker = 0;
-  state.screen?.stop();
-
-  if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
-
-  $('#opt-viewonly').checked = false;
-  toggleViewOnly(false);
-
-  if (!silent) {
-    setView('connect');
-    toast('Session ended', { warn: true });
+  try {
+    window.location.href = url;
+  } catch {
+    setError($('#launch-error'), 'This browser blocked the anydesk: link. Copy the address instead.');
+    $('#launch-fallback').hidden = false;
   }
 }
 
-/* ---------------------------------------------------------------- session UI */
+/* --------------------------------------------------------------- share (host) */
 
-const latencyEl = $('#stat-latency');
-const uptimeEl = $('#stat-uptime');
+const shareBtn = $('#share-btn');
+const preview = $('#preview-video');
+
+shareBtn.addEventListener('click', startSharing);
+
+async function startSharing() {
+  clearErrors();
+  shareBtn.disabled = true;
+
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    setError($('#share-error'), 'This browser cannot capture a screen. Try Chrome, Edge or Firefox on desktop.');
+    shareBtn.disabled = false;
+    return;
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 30, max: 60 } },
+      audio: false,
+    });
+  } catch (err) {
+    const denied = err?.name === 'NotAllowedError';
+    setError(
+      $('#share-error'),
+      denied ? 'Screen capture was cancelled or blocked. Allow it to start sharing.' : 'Could not start screen capture on this device.'
+    );
+    shareBtn.disabled = false;
+    return;
+  }
+
+  state.role = 'host';
+  state.teardown = false;
+  state.stream = stream;
+  state.address = randomDigits(9);
+  state.code = randomDigits(CODE_LEN);
+
+  preview.srcObject = stream;
+  preview.play().catch(() => {});
+  $('#share-id').textContent = group(state.address);
+  $('#share-code').textContent = groupCode(state.code);
+  $('#share-status').innerHTML = '<span class="dot dot--live" aria-hidden="true"></span> Connecting to the broker…';
+
+  stream.getVideoTracks().forEach((track) => {
+    track.addEventListener('ended', () => {
+      if (state.role === 'host' && state.view !== 'home') endSession('Screen sharing stopped');
+    });
+  });
+
+  setView('sharing');
+  createHostPeer();
+}
+
+function createHostPeer() {
+  if (!window.Peer) {
+    setError($('#share-error'), 'The signalling library failed to load. Check your connection.');
+    return;
+  }
+
+  const peer = new Peer(PEER_PREFIX + state.address, { debug: 1 });
+  state.peer = peer;
+
+  peer.on('open', () => {
+    if (state.view !== 'sharing') return;
+    $('#share-status').innerHTML = '<span class="dot dot--live" aria-hidden="true"></span> Waiting for a viewer to connect…';
+  });
+
+  peer.on('connection', onHostConnection);
+  peer.on('error', onPeerError);
+  peer.on('disconnected', () => {
+    if (!state.teardown) peer.reconnect();
+  });
+}
+
+let authFailures = [];
+
+function onHostConnection(conn) {
+  if (state.teardown) return;
+
+  const now = Date.now();
+  authFailures = authFailures.filter((t) => now - t < 60_000);
+  const locked = authFailures.length >= 8;
+  const provided = String(conn.metadata?.code ?? '');
+  const ok = !locked && provided === state.code;
+
+  if (!ok) {
+    if (!locked) authFailures.push(now);
+    conn.on('open', () => {
+      try {
+        conn.send({ t: 'denied', reason: locked ? 'Too many attempts. Wait a minute.' : 'Wrong access code.' });
+      } catch {}
+      setTimeout(() => conn.close(), 200);
+    });
+    return;
+  }
+
+  // only one viewer at a time
+  if (state.conn) {
+    try { conn.close(); } catch {}
+    return;
+  }
+
+  state.conn = conn;
+  bindConnection(conn);
+
+  const start = () => {
+    const call = state.peer.call(conn.peer, state.stream, { metadata: { code: state.code } });
+    state.call = call;
+    call.on('error', () => {});
+    openSession();
+    startStats();
+  };
+
+  if (conn.open) start();
+  else conn.on('open', start);
+}
+
+/* -------------------------------------------------------------- viewer path */
+
+$('#watch-btn').addEventListener('click', () => {
+  clearErrors();
+  const raw = idField.value.trim();
+  const code = digits($('#remote-code').value);
+
+  if (!validAddress(raw)) {
+    setError($('#launch-error'), 'Enter the 9–10 digit address shown by the host.');
+    idField.focus();
+    return;
+  }
+  if (code.length !== CODE_LEN) {
+    toast('Enter the six-digit access code', { warn: true });
+    $('#remote-code').focus();
+    return;
+  }
+
+  startWatching(normalizeAddress(raw), code);
+});
+
+$('#remote-code').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    $('#watch-btn').click();
+  }
+});
+
+$('#remote-code').addEventListener('input', (e) => {
+  const el = e.target;
+  el.value = groupCode(el.value);
+});
+
+function startWatching(address, code) {
+  state.role = 'viewer';
+  state.address = address;
+  state.code = code;
+  state.teardown = false;
+
+  $('#peer-id').textContent = group(address);
+  $('#role-badge').textContent = 'viewing';
+  $('#info-role').textContent = 'viewer';
+  $('#info-peer').textContent = group(address);
+  $('#stage-waiting-text').textContent = `Connecting to ${group(address)}…`;
+  $('#stage-waiting').classList.remove('is-hidden');
+
+  setView('session');
+  resetChat();
+  applyQuality(state.quality, { broadcast: false });
+
+  if (!window.Peer) {
+    failSession('The signalling library failed to load. Check your connection.');
+    return;
+  }
+
+  const peer = new Peer({ debug: 1 });
+  state.peer = peer;
+  state.startedAt = Date.now();
+
+  peer.on('open', () => {
+    if (state.teardown) return;
+    const conn = peer.connect(PEER_PREFIX + address, {
+      metadata: { code },
+      reliable: true,
+    });
+    state.conn = conn;
+    bindConnection(conn);
+
+    conn.on('open', () => {
+      $('#stage-waiting-text').textContent = 'Waiting for the host to answer…';
+    });
+  });
+
+  peer.on('call', (call) => {
+    state.call = call;
+    call.on('stream', attachStream);
+    call.on('close', () => {
+      if (!state.teardown) endSession('The host ended the session');
+    });
+    call.on('error', () => failSession('The video connection failed.'));
+    try { call.answer(); } catch {}
+  });
+
+  peer.on('error', onPeerError);
+
+  state.streamTimer = setTimeout(() => {
+    if (!state.stream && !state.teardown) {
+      failSession('No answer. Check the address and code, and that the host is still sharing.');
+    }
+  }, 20_000);
+}
+
+function attachStream(stream) {
+  clearTimeout(state.streamTimer);
+  state.stream = stream;
+  const video = $('#remote-video');
+  video.srcObject = stream;
+  video.play().catch(() => {});
+  $('#stage-waiting').classList.add('is-hidden');
+  startStats();
+
+  stream.getVideoTracks().forEach((track) => {
+    track.addEventListener('ended', () => {
+      if (!state.teardown) endSession('The screen share ended');
+    });
+  });
+
+  toast('Live screen connected');
+}
+
+function bindConnection(conn) {
+  conn.on('data', (data) => {
+    if (!data || typeof data !== 'object') return;
+    if (data.t === 'chat' && typeof data.text === 'string') {
+      chatBubble(data.text.slice(0, 2000), 'in');
+    }
+    if (data.t === 'denied') {
+      failSession(data.reason || 'The host refused the connection.');
+    }
+    if (data.t === 'quality' && state.role === 'host' && QUALITY[data.v]) {
+      applyQuality(data.v, { broadcast: false });
+    }
+  });
+
+  conn.on('close', () => {
+    if (state.teardown || state.view === 'home') return;
+    if (state.role === 'viewer' && !state.stream) {
+      failSession('The host closed the connection. Check the code and try again.');
+    } else if (state.role === 'host') {
+      endSession('The viewer disconnected');
+    } else {
+      endSession('The other side disconnected');
+    }
+  });
+
+  conn.on('error', () => {});
+}
+
+/* ---------------------------------------------------------------- peer errors */
+
+function onPeerError(err) {
+  const type = err?.type || '';
+  const status = $('#net-status');
+
+  const hostError = (msg) => {
+    if (state.role === 'host') {
+      endSession(msg);
+      setError($('#share-error'), msg);
+    } else {
+      failSession(msg);
+    }
+  };
+
+  if (type === 'peer-unavailable') {
+    hostError('No shared desk at that address. Is the host still on the sharing screen?');
+    return;
+  }
+  if (type === 'unavailable-id') {
+    hostError('That address is already in use. Try again.');
+    return;
+  }
+  if (type === 'network' || type === 'server-error' || type === 'socket-error') {
+    status.classList.remove('is-online');
+    status.classList.add('is-offline');
+    $('#net-status-text').textContent = 'broker offline';
+    hostError('Cannot reach the signalling broker. Try again in a moment.');
+    return;
+  }
+  if (type === 'browser-incompatible') {
+    failSession('This browser does not support the WebRTC features required.');
+  }
+}
+
+/* --------------------------------------------------------------- session view */
+
+function openSession() {
+  $('#peer-id').textContent = group(state.address);
+  $('#role-badge').textContent = state.role === 'host' ? 'sharing' : 'viewing';
+  $('#info-role').textContent = state.role === 'host' ? 'host' : 'viewer';
+  $('#info-peer').textContent = group(state.address);
+  $('#info-state').textContent = 'connecting';
+
+  if (state.role === 'host') {
+    const video = $('#remote-video');
+    video.srcObject = state.stream;
+    video.play().catch(() => {});
+    $('#stage-waiting').classList.add('is-hidden');
+  }
+
+  setView('session');
+  resetChat();
+  applyQuality(state.quality, { broadcast: false });
+  $('#stage-hint').classList.remove('is-faded');
+  setTimeout(() => $('#stage-hint').classList.add('is-faded'), 6000);
+}
+
+/* --------------------------------------------------------------------- stats */
+
+function startStats() {
+  clearInterval(state.statsTimer);
+  state.lastBytes = 0;
+  state.lastTs = 0;
+  state.lastFrames = 0;
+  if (!state.startedAt) state.startedAt = Date.now();
+  state.statsTimer = setInterval(tickStats, 1000);
+  tickStats();
+}
 
 function fmtUptime(ms) {
   const total = Math.floor(ms / 1000);
@@ -339,41 +546,139 @@ function fmtUptime(ms) {
   return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
 }
 
-function startTicker() {
-  clearInterval(state.ticker);
-  const update = () => {
-    if (!state.startedAt) return;
-    const uptime = Date.now() - state.startedAt;
-    const ms = Math.round(11 + Math.random() * 16 + Math.sin(uptime / 9000) * 5);
-    const fps = clamp(Math.round(58 + Math.sin(uptime / 4000) * 3 - Math.random() * 3), 48, 60);
-    const mbps = (3.4 + Math.abs(Math.sin(uptime / 12000)) * 5.2).toFixed(1);
-    const pretty = fmtUptime(uptime);
+async function tickStats() {
+  const pc = state.call?.peerConnection;
+  if (!pc || state.teardown) return;
 
-    latencyEl.textContent = ms;
-    uptimeEl.textContent = pretty;
-    $('#info-latency').textContent = `${ms} ms`;
-    $('#info-uptime').textContent = pretty;
-    $('#info-fps').textContent = `${fps} fps`;
-    $('#info-bitrate').textContent = `${mbps} Mb/s`;
-  };
-  update();
-  state.ticker = setInterval(update, 1000);
+  let report;
+  try {
+    report = await pc.getStats();
+  } catch {
+    return;
+  }
+
+  const byId = new Map();
+  report.forEach((r) => byId.set(r.id, r));
+
+  let inbound = null;
+  let outbound = null;
+  let pair = null;
+  report.forEach((r) => {
+    if (r.type === 'inbound-rtp' && r.kind === 'video') inbound = r;
+    else if (r.type === 'outbound-rtp' && r.kind === 'video') outbound = r;
+    else if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r;
+  });
+
+  const rtp = inbound || outbound;
+  const now = performance.now();
+  const bytes = rtp ? (inbound ? rtp.bytesReceived : rtp.bytesSent) || 0 : 0;
+
+  let mbps = 0;
+  if (state.lastTs && now > state.lastTs && bytes >= state.lastBytes) {
+    mbps = ((bytes - state.lastBytes) * 8) / ((now - state.lastTs) / 1000) / 1e6;
+  }
+  state.lastBytes = bytes;
+  state.lastTs = now;
+
+  let fps = rtp?.framesPerSecond;
+  if (fps == null && outbound && outbound.framesEncoded != null) {
+    const deltaFrames = outbound.framesEncoded - (state.lastFrames || 0);
+    fps = deltaFrames > 0 ? deltaFrames : 0;
+    state.lastFrames = outbound.framesEncoded;
+  }
+
+  const width = rtp?.frameWidth || $('#remote-video').videoWidth || 0;
+  const height = rtp?.frameHeight || $('#remote-video').videoHeight || 0;
+  const rtt = pair?.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null;
+
+  const codec = rtp?.codecId ? byId.get(rtp.codecId) : null;
+  const codecName = codec?.mimeType ? codec.mimeType.replace('video/', '').toUpperCase() : null;
+
+  const local = pair?.localCandidateId ? byId.get(pair.localCandidateId) : null;
+  const remote = pair?.remoteCandidateId ? byId.get(pair.remoteCandidateId) : null;
+  const route = local && remote ? `${local.candidateType} → ${remote.candidateType}` : null;
+
+  $('#stat-latency').textContent = rtt != null ? rtt : '—';
+  $('#stat-fps').textContent = fps != null ? Math.round(fps) : '—';
+  $('#stat-res').textContent = width && height ? `${width}×${height}` : '—';
+  $('#stat-bitrate').textContent = mbps > 0 ? mbps.toFixed(1) : '—';
+
+  $('#info-latency').textContent = rtt != null ? `${rtt} ms` : '—';
+  $('#info-fps').textContent = fps != null ? `${Math.round(fps)} fps` : '—';
+  $('#info-res').textContent = width && height ? `${width}×${height}` : '—';
+  $('#info-bitrate').textContent = mbps > 0 ? `${mbps.toFixed(1)} Mb/s` : '—';
+  $('#info-codec').textContent = codecName || '—';
+  $('#info-route').textContent = route || '—';
+  $('#info-state').textContent = pc.connectionState || '—';
+  $('#info-uptime').textContent = fmtUptime(Date.now() - state.startedAt);
 }
 
-function applyQuality(quality) {
-  const q = QUALITY[quality] || QUALITY.balanced;
+/* ------------------------------------------------------------------- quality */
+
+function applyQuality(quality, { broadcast = true } = {}) {
+  const cfg = QUALITY[quality] || QUALITY.balanced;
   state.quality = quality;
   $('#quality').value = quality;
-  $('#hud-quality').textContent = `${q.label} · ${q.resolution}`;
-  $('#stat-res').textContent = q.resolution;
-  $('#info-res').textContent = q.resolution;
+  $('#hud-quality').textContent = cfg.label;
+
+  const pc = state.call?.peerConnection;
+  const sender = pc?.getSenders?.().find((s) => s.track && s.track.kind === 'video');
+  if (sender) {
+    try {
+      const params = sender.getParameters();
+      params.encodings = params.encodings?.length ? params.encodings : [{}];
+      params.encodings.forEach((enc) => { enc.maxBitrate = cfg.maxBitrate; });
+      sender.setParameters(params).catch(() => {});
+    } catch {}
+  }
+
+  if (broadcast && state.role === 'viewer' && state.conn?.open) {
+    try { state.conn.send({ t: 'quality', v: quality }); } catch {}
+  }
 }
 
-function toggleViewOnly(on) {
-  const hud = $('#hud-viewonly');
-  hud.hidden = !on;
-  if (on) toast('View only — input is ignored', { warn: true });
+$('#quality').addEventListener('change', (e) => applyQuality(e.target.value));
+
+/* ---------------------------------------------------------------------- chat */
+
+function chatBubble(text, dir) {
+  const li = document.createElement('li');
+  li.className = `chat__msg chat__msg--${dir}`;
+  const who = document.createElement('span');
+  who.className = 'chat__who';
+  who.textContent = dir === 'in' ? (state.role === 'host' ? 'Viewer' : 'Host') : 'You';
+  const p = document.createElement('p');
+  p.textContent = text;
+  li.append(who, p);
+  const log = $('#chat-log');
+  log.append(li);
+  log.scrollTop = log.scrollHeight;
 }
+
+function resetChat() {
+  const log = $('#chat-log');
+  log.replaceChildren();
+  const li = document.createElement('li');
+  li.className = 'chat__msg chat__msg--in';
+  li.innerHTML = '<span class="chat__who">System</span><p>Connected. Messages go straight to the other browser.</p>';
+  log.append(li);
+}
+
+$('#chat-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const input = $('#chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  if (!state.conn?.open) {
+    toast('Not connected yet', { warn: true });
+    return;
+  }
+  try { state.conn.send({ t: 'chat', text }); } catch {}
+  chatBubble(text, 'out');
+  input.value = '';
+});
+
+/* ------------------------------------------------------------------- drawers */
 
 function toggleDrawer(name, force) {
   const drawer = $(`[data-drawer="${name}"]`);
@@ -385,8 +690,7 @@ function toggleDrawer(name, force) {
 
   drawer.classList.add('is-open');
   drawer.setAttribute('aria-hidden', 'false');
-  const btn = $(`[data-action="toggle-${name}"]`);
-  btn?.setAttribute('aria-pressed', 'true');
+  $(`[data-action="toggle-${name}"]`)?.setAttribute('aria-pressed', 'true');
 
   if (name === 'chat') setTimeout(() => $('#chat-input').focus({ preventScroll: true }), 120);
 }
@@ -399,126 +703,96 @@ function closeAllDrawers() {
   $$('[data-action="toggle-chat"], [data-action="toggle-info"]').forEach((b) => b.setAttribute('aria-pressed', 'false'));
 }
 
-/* --------------------------------------------------------------------- chat */
+/* ------------------------------------------------------------------- teardown */
 
-function chatBubble(text, dir) {
-  const li = document.createElement('li');
-  li.className = `chat__msg chat__msg--${dir}`;
-  const who = document.createElement('span');
-  who.className = 'chat__who';
-  who.textContent = dir === 'in' ? 'Remote' : 'You';
-  const p = document.createElement('p');
-  p.textContent = text;
-  li.append(who, p);
-  const log = $('#chat-log');
-  log.append(li);
-  log.scrollTop = log.scrollHeight;
+function endSession(message) {
+  state.teardown = true;
+  clearTimeout(state.streamTimer);
+  clearInterval(state.statsTimer);
+
+  try { state.conn?.close(); } catch {}
+  try { state.call?.close(); } catch {}
+  try { state.peer?.destroy(); } catch {}
+  state.stream?.getTracks().forEach((t) => t.stop());
+
+  $('#remote-video').srcObject = null;
+  preview.srcObject = null;
+  state.stream = null;
+  state.conn = null;
+  state.call = null;
+  state.peer = null;
+  state.role = null;
+  state.startedAt = 0;
+  state.lastBytes = 0;
+  state.lastTs = 0;
+
+  closeAllDrawers();
+  setView('home');
+  shareBtn.disabled = false;
+
+  if (message) toast(message, { warn: true });
 }
 
-function resetChat() {
-  const log = $('#chat-log');
-  log.replaceChildren();
-  chatBubble(`Session is up. Send me the build log when you're ready.`, 'in');
+function failSession(message) {
+  if (state.view !== 'session') return;
+  endSession();
+  setError($('#launch-error'), message);
+  toast(message, { error: true, ms: 5000 });
 }
-
-$('#chat-form').addEventListener('submit', (e) => {
-  e.preventDefault();
-  const fieldInput = $('#chat-input');
-  const text = fieldInput.value.trim();
-  if (!text) return;
-  chatBubble(text, 'out');
-  fieldInput.value = '';
-
-  clearTimeout(state.chatTimer);
-  state.chatTimer = setTimeout(() => {
-    if (state.view !== 'session') return;
-    chatBubble(CHAT_REPLIES[Math.floor(Math.random() * CHAT_REPLIES.length)], 'in');
-  }, 900 + Math.random() * 900);
-});
 
 /* ------------------------------------------------------------------- actions */
 
 document.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-action]');
   if (!el) return;
-  const { action } = el.dataset;
 
-  switch (action) {
+  switch (el.dataset.action) {
     case 'dismiss-notice':
       $('#notice').classList.add('is-hidden');
       break;
 
     case 'home':
       e.preventDefault();
-      if (state.view === 'session') endSession({ silent: true });
-      clearTimers();
-      setView('connect');
+      if (state.view === 'sharing' || state.view === 'session') endSession();
+      clearErrors();
+      setView('home');
       break;
 
     case 'paste-id': {
       try {
         const text = await navigator.clipboard.readText();
-        const id = group(text);
-        if (digits(id).length === 9) {
-          input.value = id;
-          setError('');
-          toast('Address pasted');
-        } else {
-          toast('Clipboard has no nine-digit address', { warn: true });
-        }
+        idField.value = group(text.trim());
+        setError($('#launch-error'), '');
+        if (validAddress(idField.value)) toast('Address pasted');
+        else toast('Clipboard has no AnyDesk address', { warn: true });
       } catch {
         toast('Clipboard blocked by the browser', { warn: true });
-        input.focus();
+        idField.focus();
       }
       break;
     }
 
-    case 'random-id':
-      input.value = randomId();
-      setError('');
-      break;
-
-    case 'copy-self': {
-      const id = $('#self-id').textContent.trim();
-      try {
-        await navigator.clipboard.writeText(id);
-        toast('Your address copied');
-      } catch {
-        toast(id, { ms: 4000 });
-      }
+    case 'copy-address': {
+      const ok = await copyText(state.address || normalizeAddress(idField.value));
+      toast(ok ? 'Address copied' : 'Copy failed — select it manually', { warn: !ok });
       break;
     }
 
-    case 'clear-recent':
-      store(STORE.recent, JSON.stringify([]));
-      renderRecent();
-      toast('History cleared');
-      break;
-
-    case 'reconnect':
-      input.value = el.dataset.id;
-      startConnect(el.dataset.id);
-      break;
-
-    case 'forget': {
-      const list = loadRecent().filter((r) => r.id !== el.dataset.id);
-      store(STORE.recent, JSON.stringify(list));
-      renderRecent();
+    case 'copy-share': {
+      const text = `AnyDesk Web Client\nAddress: ${group(state.address)}\nCode: ${groupCode(state.code)}\n${location.origin}${location.pathname}#desk/${state.address}`;
+      const ok = await copyText(text);
+      toast(ok ? 'Address and code copied' : 'Copy failed', { warn: !ok });
       break;
     }
 
-    case 'cancel-connect':
-      clearTimers();
-      setView('connect');
-      break;
-
+    case 'stop-sharing':
     case 'disconnect':
-      endSession();
+      endSession(state.role === 'host' ? 'Stopped sharing' : undefined);
       break;
 
     case 'toggle-chat':
     case 'toggle-info':
-      toggleDrawer(action.replace('toggle-', ''));
+      toggleDrawer(el.dataset.action.replace('toggle-', ''));
       break;
 
     case 'toggle-fullscreen':
@@ -530,24 +804,7 @@ document.addEventListener('click', async (e) => {
   }
 });
 
-$('#connect-form').addEventListener('submit', (e) => {
-  e.preventDefault();
-  startConnect(input.value);
-});
-
-$('#quality').addEventListener('change', (e) => {
-  const quality = e.target.value;
-  applyQuality(quality);
-  state.screen?.setQuality(quality);
-});
-
-$('#opt-viewonly').addEventListener('change', (e) => toggleViewOnly(e.target.checked));
-
-$('#opt-clipboard').addEventListener('change', (e) => {
-  toast(e.target.checked ? 'Clipboard sync on (demo)' : 'Clipboard sync off');
-});
-
-/* --------------------------------------------------------------- fullscreen */
+/* ----------------------------------------------------------------- fullscreen */
 
 async function toggleFullscreen() {
   const stage = $('#stage');
@@ -565,27 +822,26 @@ async function toggleFullscreen() {
 }
 
 document.addEventListener('fullscreenchange', () => {
-  const btn = $('[data-action="toggle-fullscreen"] .btn__text');
-  if (btn) btn.textContent = document.fullscreenElement ? 'Windowed' : 'Fullscreen';
+  const label = $('[data-action="toggle-fullscreen"] .btn__text');
+  if (label) label.textContent = document.fullscreenElement ? 'Windowed' : 'Fullscreen';
 });
 
-/* ------------------------------------------------------------------ keyboard */
+/* ------------------------------------------------------------------- keyboard */
 
 document.addEventListener('keydown', (e) => {
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable;
 
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
     e.preventDefault();
-    if (state.view === 'session') endSession({ silent: true });
-    setView('connect');
-    input.focus();
-    input.select();
+    if (state.view === 'session' || state.view === 'sharing') endSession();
+    setView('home');
+    idField.focus();
+    idField.select();
     return;
   }
 
   if (e.key === 'Escape') {
-    const openDrawer = $('.drawer.is-open');
-    if (openDrawer) {
+    if ($('.drawer.is-open')) {
       closeAllDrawers();
       if (typing) e.target.blur();
       return;
@@ -605,21 +861,37 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-/* ---------------------------------------------------------------- bootstrap */
+/* ------------------------------------------------------------------ bootstrap */
 
 function boot() {
-  initIdentity();
-  renderRecent();
+  // status pill reflects real capabilities, not a fake heartbeat
+  const status = $('#net-status');
+  const canCapture = !!navigator.mediaDevices?.getDisplayMedia;
+  const canRtc = typeof RTCPeerConnection === 'function';
+  const canSignal = !!window.Peer;
 
-  // deep link: #desk/123456789 opens straight into a session
-  const hash = location.hash.match(/^#desk\/(\d{9})$/);
-  if (hash) startConnect(hash[1]);
-  else setView('connect');
+  if (canRtc && canSignal) {
+    status.classList.add('is-online');
+    $('#net-status-text').textContent = canCapture ? 'ready to share' : 'viewer ready';
+  } else {
+    status.classList.add('is-offline');
+    $('#net-status-text').textContent = 'unsupported';
+  }
 
-  // keep "3m ago" labels honest
-  setInterval(() => {
-    if (state.view === 'connect') renderRecent();
-  }, 60000);
+  if (!canCapture) {
+    shareBtn.disabled = true;
+    setError($('#share-error'), 'Screen capture is not available in this browser. You can still watch a shared desk.');
+  }
+
+  // deep link: #desk/123456789 or #desk/123456789/123456
+  const hash = location.hash.match(/^#desk\/([\w@.-]{6,32})(?:\/(\d{6}))?$/);
+  if (hash) {
+    idField.value = group(hash[1]);
+    if (hash[2]) $('#remote-code').value = groupCode(hash[2]);
+    toast('Address filled from link');
+  }
+
+  setView('home');
 }
 
 boot();
