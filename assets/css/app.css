@@ -987,6 +987,15 @@ body.is-session .footer { display: none; }
   transform: translateX(-50%);
   pointer-events: none;
 }
+/* keep session toasts clear of the floating toolbar */
+body.is-session .toasts {
+  left: auto;
+  right: clamp(12px, 2vw, 24px);
+  bottom: 84px;
+  align-items: flex-end;
+  transform: none;
+  max-width: min(360px, calc(100vw - 32px));
+}
 .toast {
   display: flex; align-items: center; gap: 9px;
   padding: 10px 16px;
@@ -1028,6 +1037,11 @@ body.is-session .footer { display: none; }
   .keys__row p { margin-left: auto; }
   .stage__hint { display: none; }
   .dial__ring { width: 340px; height: 340px; }
+
+  /* keep the simulated desk at its native shape instead of floating in a
+     portrait-sized black box */
+  .stage { aspect-ratio: 16 / 9; max-height: 100%; align-self: start; }
+  .stage__hud { display: none; }
 }
 @media (max-width: 460px) {
   .brand__text em { display: none; }

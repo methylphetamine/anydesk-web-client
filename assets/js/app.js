@@ -102,6 +102,7 @@ function setView(name) {
   } else if (name === 'connecting') {
     $('#cancel-connect')?.focus({ preventScroll: true });
   } else if (name === 'session') {
+    window.scrollTo(0, 0);
     $('#stage').setAttribute('tabindex', '-1');
     $('#stage').focus({ preventScroll: true });
   }
